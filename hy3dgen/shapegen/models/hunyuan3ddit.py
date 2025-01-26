@@ -37,12 +37,9 @@ def attention(q: Tensor, k: Tensor, v: Tensor, **kwargs) -> Tensor:
     x = rearrange(x, "B H L D -> B L (H D)")
     return x
 
-try:
-    from sageattention import sageattn
-except ImportError:
-    sageattn = None
     
 def attention_sage(q: Tensor, k: Tensor, v: Tensor, **kwargs) -> Tensor:
+    from sageattention import sageattn
     x = sageattn(q, k, v)
     x = rearrange(x, "B H L D -> B L (H D)")
     return x

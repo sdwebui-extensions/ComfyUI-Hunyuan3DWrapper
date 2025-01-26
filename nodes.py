@@ -121,13 +121,16 @@ class DownloadAndLoadHy3DDelightModel:
         
         if not os.path.exists(model_path):
             log.info(f"Downloading model to: {model_path}")
-            from huggingface_hub import snapshot_download
-            snapshot_download(
-                repo_id="tencent/Hunyuan3D-2",
-                allow_patterns=["*hunyuan3d-delight-v2-0*"],
-                local_dir=download_path,
-                local_dir_use_symlinks=False,
-            )
+            if os.path.exists('/stable-diffusion-cache/models/diffusers/hunyuan3d-delight-v2-0'):
+                model_path = '/stable-diffusion-cache/models/diffusers/hunyuan3d-delight-v2-0'
+            else:
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    repo_id="tencent/Hunyuan3D-2",
+                    allow_patterns=["*hunyuan3d-delight-v2-0*"],
+                    local_dir=download_path,
+                    local_dir_use_symlinks=False,
+                )
 
         from diffusers import StableDiffusionInstructPix2PixPipeline, EulerAncestralDiscreteScheduler
 
@@ -210,13 +213,16 @@ class DownloadAndLoadHy3DPaintModel:
         
         if not os.path.exists(model_path):
             log.info(f"Downloading model to: {model_path}")
-            from huggingface_hub import snapshot_download
-            snapshot_download(
-                repo_id="tencent/Hunyuan3D-2",
-                allow_patterns=[f"*{model}*"],
-                local_dir=download_path,
-                local_dir_use_symlinks=False,
-            )
+            if os.path.exists('/stable-diffusion-cache/models/diffusers/hunyuan3d-paint-v2-0'):
+                model_path = '/stable-diffusion-cache/models/diffusers/hunyuan3d-paint-v2-0'
+            else:
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    repo_id="tencent/Hunyuan3D-2",
+                    allow_patterns=[f"*{model}*"],
+                    local_dir=download_path,
+                    local_dir_use_symlinks=False,
+                )
 
         from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
         custom_pipeline_path = os.path.join(script_directory, 'hy3dgen', 'texgen', 'hunyuanpaint')
