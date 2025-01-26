@@ -31,7 +31,6 @@ from typing import List, Optional, Union
 
 import numpy as np
 import torch
-import trimesh
 import yaml
 from PIL import Image
 from diffusers.utils.torch_utils import randn_tensor
@@ -106,6 +105,7 @@ def retrieve_timesteps(
 
 
 def export_to_trimesh(mesh_output):
+    import trimesh
     if isinstance(mesh_output, list):
         outputs = []
         for mesh in mesh_output:
@@ -567,7 +567,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         # output_type: Optional[str] = "trimesh",
         enable_pbar=True,
         **kwargs,
-    ) -> List[List[trimesh.Trimesh]]:
+    ):
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
 

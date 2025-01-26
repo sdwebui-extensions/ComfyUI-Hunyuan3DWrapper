@@ -31,10 +31,6 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from skimage import measure
 from tqdm import tqdm
-try:
-    from sageattention import sageattn
-except ImportError:
-    sageattn = None
 from comfy.utils import ProgressBar
 
 class FourierEmbedder(nn.Module):
@@ -203,6 +199,7 @@ class QKVMultiheadCrossAttention(nn.Module):
         if attention_mode == "sdpa":
             self.attention_func = F.scaled_dot_product_attention
         elif attention_mode == "sageattn":
+            from sageattention import sageattn
             self.attention_func = sageattn
 
     def forward(self, q, kv):
@@ -320,6 +317,7 @@ class QKVMultiheadAttention(nn.Module):
         if attention_mode == "sdpa":
             self.attention_func = F.scaled_dot_product_attention
         elif attention_mode == "sageattn":
+            from sageattention import sageattn
             self.attention_func = sageattn
 
     def forward(self, qkv):

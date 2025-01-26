@@ -4,7 +4,6 @@ import torchvision.transforms as transforms
 from PIL import Image
 from pathlib import Path
 import numpy as np
-import trimesh
 
 from .hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline, FaceReducer, FloaterRemover, DegenerateFaceRemover
 
@@ -682,6 +681,7 @@ class Hy3DLoadMesh:
     DESCRIPTION = "Loads a glb model from the given path."
 
     def load(self, glb_path):
+        import trimesh
         
         mesh = trimesh.load(glb_path, force="mesh")
         
@@ -764,6 +764,7 @@ class Hy3DVAEDecode:
     CATEGORY = "Hunyuan3DWrapper"
 
     def process(self, vae, latents, box_v, octree_resolution, mc_level, num_chunks, mc_algo):
+        import trimesh
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
@@ -807,6 +808,7 @@ class Hy3DPostprocessMesh:
     CATEGORY = "Hunyuan3DWrapper"
 
     def process(self, mesh, remove_floaters, remove_degenerate_faces, reduce_faces, max_facenum, smooth_normals):
+        import trimesh
         new_mesh = mesh.copy()
         if remove_floaters:
             new_mesh = FloaterRemover()(new_mesh)
@@ -874,6 +876,7 @@ class Hy3DSetMeshPBRTextures:
     CATEGORY = "Hunyuan3DWrapper"
 
     def set_textures(self, mesh, image, texture):
+        import trimesh
         from trimesh.visual.material import SimpleMaterial
         if isinstance(mesh.visual.material, SimpleMaterial):
             log.info("Found SimpleMaterial, Converting to PBRMaterial")

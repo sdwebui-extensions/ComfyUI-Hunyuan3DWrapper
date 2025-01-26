@@ -26,8 +26,6 @@ import tempfile
 import os
 from typing import Union
 
-import pymeshlab
-import trimesh
 
 from .models.vae import Latent2MeshOutput
 
@@ -35,6 +33,8 @@ import folder_paths
 
 
 def load_mesh(path):
+    import trimesh
+    import pymeshlab
     if path.endswith(".glb"):
         mesh = trimesh.load(path)
     else:
@@ -43,7 +43,7 @@ def load_mesh(path):
     return mesh
 
 
-def reduce_face(mesh: pymeshlab.MeshSet, max_facenum: int = 200000):
+def reduce_face(mesh, max_facenum: int = 200000):
     mesh.apply_filter(
         "meshing_decimation_quadric_edge_collapse",
         targetfacenum=max_facenum,
@@ -57,7 +57,7 @@ def reduce_face(mesh: pymeshlab.MeshSet, max_facenum: int = 200000):
     return mesh
 
 
-def remove_floater(mesh: pymeshlab.MeshSet):
+def remove_floater(mesh):
     mesh.apply_filter("compute_selection_by_small_disconnected_components_per_face",
                       nbfaceratio=0.005)
     mesh.apply_filter("compute_selection_transfer_face_to_vertex", inclusive=False)
@@ -65,7 +65,8 @@ def remove_floater(mesh: pymeshlab.MeshSet):
     return mesh
 
 
-def pymeshlab2trimesh(mesh: pymeshlab.MeshSet):
+def pymeshlab2trimesh(mesh):
+    import trimesh
     # Create temp directory with explicit permissions
     temp_dir = folder_paths.temp_directory
     os.makedirs(temp_dir, exist_ok=True)
@@ -97,7 +98,9 @@ def pymeshlab2trimesh(mesh: pymeshlab.MeshSet):
         raise Exception(f"Error in pymeshlab2trimesh: {str(e)}")
 
 
-def trimesh2pymeshlab(mesh: trimesh.Trimesh):
+def trimesh2pymeshlab(mesh):
+    import trimesh
+    import pymeshlab
     # Create temp directory with explicit permissions
     temp_dir = folder_paths.temp_directory
     os.makedirs(temp_dir, exist_ok=True)
@@ -133,6 +136,7 @@ def trimesh2pymeshlab(mesh: trimesh.Trimesh):
 
 
 def export_mesh(input, output):
+    import pymeshlab
     if isinstance(input, pymeshlab.MeshSet):
         mesh = output
     elif isinstance(input, Latent2MeshOutput):
@@ -145,7 +149,9 @@ def export_mesh(input, output):
     return mesh
 
 
-def import_mesh(mesh: Union[pymeshlab.MeshSet, trimesh.Trimesh, Latent2MeshOutput, str]) -> pymeshlab.MeshSet:
+def import_mesh(mesh: Union[Latent2MeshOutput, str]):
+    import trimesh
+    import pymeshlab
     if isinstance(mesh, str):
         mesh = load_mesh(mesh)
     elif isinstance(mesh, Latent2MeshOutput):
@@ -162,9 +168,9 @@ def import_mesh(mesh: Union[pymeshlab.MeshSet, trimesh.Trimesh, Latent2MeshOutpu
 class FaceReducer:
     def __call__(
         self,
-        mesh: Union[pymeshlab.MeshSet, trimesh.Trimesh, Latent2MeshOutput, str],
+        mesh: Union[Latent2MeshOutput, str],
         max_facenum: int = 40000
-    ) -> Union[pymeshlab.MeshSet, trimesh.Trimesh]:
+    ):
         ms = import_mesh(mesh)
         ms = reduce_face(ms, max_facenum=max_facenum)
         mesh = export_mesh(mesh, ms)
@@ -174,8 +180,8 @@ class FaceReducer:
 class FloaterRemover:
     def __call__(
         self,
-        mesh: Union[pymeshlab.MeshSet, trimesh.Trimesh, Latent2MeshOutput, str],
-    ) -> Union[pymeshlab.MeshSet, trimesh.Trimesh, Latent2MeshOutput]:
+        mesh: Union[Latent2MeshOutput, str],
+    ) -> Union[Latent2MeshOutput]:
         ms = import_mesh(mesh)
         ms = remove_floater(ms)
         mesh = export_mesh(mesh, ms)
@@ -185,8 +191,9 @@ class FloaterRemover:
 class DegenerateFaceRemover:
     def __call__(
         self,
-        mesh: Union[pymeshlab.MeshSet, trimesh.Trimesh, Latent2MeshOutput, str],
-    ) -> Union[pymeshlab.MeshSet, trimesh.Trimesh, Latent2MeshOutput]:
+        mesh: Union[Latent2MeshOutput, str],
+    ) -> Union[Latent2MeshOutput]:
+        import pymeshlab
         ms = import_mesh(mesh)
 
         # Create temp file with explicit closing
