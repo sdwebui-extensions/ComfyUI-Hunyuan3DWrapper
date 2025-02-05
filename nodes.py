@@ -1,16 +1,54 @@
 import os
 import torch
 import torchvision.transforms as transforms
+import torch.nn.functional as F
 from PIL import Image
 from pathlib import Path
 import numpy as np
+import json
+from tqdm import tqdm
 
 from .hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline, FaceReducer, FloaterRemover, DegenerateFaceRemover
+from .hy3dgen.texgen.hunyuanpaint.unet.modules import UNet2DConditionModel, UNet2p5DConditionModel
+from .hy3dgen.texgen.hunyuanpaint.pipeline import HunyuanPaintPipeline
+
+from diffusers import AutoencoderKL
+from diffusers.schedulers import (
+    DDIMScheduler, 
+    PNDMScheduler, 
+    DPMSolverMultistepScheduler, 
+    EulerDiscreteScheduler, 
+    EulerAncestralDiscreteScheduler,
+    UniPCMultistepScheduler,
+    HeunDiscreteScheduler,
+    SASolverScheduler,
+    DEISMultistepScheduler,
+    LCMScheduler
+    )
+
+scheduler_mapping = {
+    "DPM++": DPMSolverMultistepScheduler,
+    "DPM++SDE": DPMSolverMultistepScheduler,
+    "Euler": EulerDiscreteScheduler,
+    "Euler A": EulerAncestralDiscreteScheduler,
+    "PNDM": PNDMScheduler,
+    "DDIM": DDIMScheduler,
+    "SASolverScheduler": SASolverScheduler,
+    "UniPCMultistepScheduler": UniPCMultistepScheduler,
+    "HeunDiscreteScheduler": HeunDiscreteScheduler,
+    "DEISMultistepScheduler": DEISMultistepScheduler,
+    "LCMScheduler": LCMScheduler
+}
+available_schedulers = list(scheduler_mapping.keys())
+from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
+
+from accelerate import init_empty_weights
+from accelerate.utils import set_module_tensor_to_device
 
 import folder_paths
 
 import comfy.model_management as mm
-from comfy.utils import load_torch_file, ProgressBar
+from comfy.utils import load_torch_file, ProgressBar, common_upscale
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
@@ -73,6 +111,7 @@ class Hy3DModelLoader:
             "optional": {
                 "compile_args": ("HY3DCOMPILEARGS", {"tooltip": "torch.compile settings, when connected to the model loader, torch.compile of the selected models is attempted. Requires Triton and torch 2.5.0 is recommended"}),
                 "attention_mode": (["sdpa", "sageattn"], {"default": "sdpa"}),
+                "cublas_ops": ("BOOLEAN", {"default": False, "tooltip": "Enable optimized cublas linear layers, speeds up decoding: https://github.com/aredden/torch-cublas-hgemm"}),
             }
         }
 
@@ -81,7 +120,7 @@ class Hy3DModelLoader:
     FUNCTION = "loadmodel"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def loadmodel(self, model, compile_args=None, attention_mode="sdpa"):
+    def loadmodel(self, model, compile_args=None, attention_mode="sdpa", cublas_ops=False):
         device = mm.get_torch_device()
         offload_device=mm.unet_offload_device()
 
@@ -94,7 +133,8 @@ class Hy3DModelLoader:
             device=device, 
             offload_device=offload_device,
             compile_args=compile_args,
-            attention_mode=attention_mode)
+            attention_mode=attention_mode,
+            cublas_ops=cublas_ops)
         
         return (pipe, vae,)
 
@@ -105,16 +145,18 @@ class DownloadAndLoadHy3DDelightModel:
             "required": {
                 "model": (["hunyuan3d-delight-v2-0"],),
             },
+            "optional": {
+                "compile_args": ("HY3DCOMPILEARGS", {"tooltip": "torch.compile settings, when connected to the model loader, torch.compile of the selected models is attempted. Requires Triton and torch 2.5.0 is recommended"}),
+            }
         }
 
-    RETURN_TYPES = ("DELIGHTMODEL",)
+    RETURN_TYPES = ("HY3DDIFFUSERSPIPE",)
     RETURN_NAMES = ("delight_pipe", )
     FUNCTION = "loadmodel"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def loadmodel(self, model):
+    def loadmodel(self, model, compile_args=None):
         device = mm.get_torch_device()
-        offload_device = mm.unet_offload_device()
 
         download_path = os.path.join(folder_paths.models_dir,"diffusers")
         model_path = os.path.join(download_path, model)
@@ -141,7 +183,17 @@ class DownloadAndLoadHy3DDelightModel:
         )
         delight_pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(delight_pipe.scheduler.config)
         delight_pipe = delight_pipe.to(device, torch.float16)
-        delight_pipe.enable_model_cpu_offload()
+
+        
+
+        if compile_args is not None:
+            torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
+            if compile_args["compile_transformer"]:
+                delight_pipe.unet = torch.compile(delight_pipe.unet)
+            if compile_args["compile_vae"]:
+                delight_pipe.vae = torch.compile(delight_pipe.vae)
+        else:
+            delight_pipe.enable_model_cpu_offload()
         
         return (delight_pipe,)
         
@@ -150,14 +202,16 @@ class Hy3DDelightImage:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "delight_pipe": ("DELIGHTMODEL",),
+                "delight_pipe": ("HY3DDIFFUSERSPIPE",),
                 "image": ("IMAGE", ),
                 "steps": ("INT", {"default": 50, "min": 1}),
                 "width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16}),
-                "cfg_image": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 100.0, "step": 0.01}),
-                "cfg_text": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01}),
+                "cfg_image": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+        },
+        "optional": {
+            "scheduler": ("NOISESCHEDULER",),
         }
     }
 
@@ -166,12 +220,21 @@ class Hy3DDelightImage:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, delight_pipe, image, width, height, cfg_image, cfg_text, steps, seed):
+    def process(self, delight_pipe, image, width, height, cfg_image, steps, seed, scheduler=None):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
+        if scheduler is not None:
+            if not hasattr(self, "default_scheduler"):
+                self.default_scheduler = delight_pipe.scheduler
+            delight_pipe.scheduler = scheduler
+        else:
+            if hasattr(self, "default_scheduler"):
+                delight_pipe.scheduler = self.default_scheduler
+
         image = image.permute(0, 3, 1, 2).to(device)
+        image = common_upscale(image, width, height, "lanczos", "disabled")
 
         image = delight_pipe(
             prompt="",
@@ -181,7 +244,7 @@ class Hy3DDelightImage:
             width=width,
             num_inference_steps=steps,
             image_guidance_scale=cfg_image,
-            guidance_scale=cfg_text,
+            guidance_scale=1.0 if cfg_image == 1.0 else 1.01, #enable cfg for image, value doesn't matter as it do anything for text anyway
             output_type="pt",
             
         ).images[0]
@@ -197,14 +260,17 @@ class DownloadAndLoadHy3DPaintModel:
             "required": {
                 "model": (["hunyuan3d-paint-v2-0"],),
             },
+            "optional": {
+                "compile_args": ("HY3DCOMPILEARGS", {"tooltip": "torch.compile settings, when connected to the model loader, torch.compile of the selected models is attempted. Requires Triton and torch 2.5.0 is recommended"}),
+            }
         }
 
-    RETURN_TYPES = ("HY3DPAINTMODEL",)
+    RETURN_TYPES = ("HY3DDIFFUSERSPIPE",)
     RETURN_NAMES = ("multiview_pipe", )
     FUNCTION = "loadmodel"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def loadmodel(self, model):
+    def loadmodel(self, model, compile_args=None):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
@@ -220,20 +286,64 @@ class DownloadAndLoadHy3DPaintModel:
                 snapshot_download(
                     repo_id="tencent/Hunyuan3D-2",
                     allow_patterns=[f"*{model}*"],
+                    ignore_patterns=["*diffusion_pytorch_model.bin"],
                     local_dir=download_path,
                     local_dir_use_symlinks=False,
                 )
 
-        from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
-        custom_pipeline_path = os.path.join(script_directory, 'hy3dgen', 'texgen', 'hunyuanpaint')
+        torch_dtype = torch.float16
+        config_path = os.path.join(model_path, 'unet', 'config.json')
+        unet_ckpt_path_safetensors = os.path.join(model_path, 'unet','diffusion_pytorch_model.safetensors')
+        unet_ckpt_path_bin = os.path.join(model_path, 'unet','diffusion_pytorch_model.bin')
 
-        pipeline = DiffusionPipeline.from_pretrained(
-            model_path,
-            custom_pipeline=custom_pipeline_path, 
-            torch_dtype=torch.float16)
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config not found at {config_path}")
+        
 
-        pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config, timestep_spacing='trailing')
-        pipeline.enable_model_cpu_offload()
+        with open(config_path, 'r', encoding='utf-8') as file:
+            config = json.load(file)
+
+        with init_empty_weights():
+            unet = UNet2DConditionModel(**config)
+            unet = UNet2p5DConditionModel(unet)
+
+        # Try loading safetensors first, fall back to .bin
+        if os.path.exists(unet_ckpt_path_safetensors):
+            import safetensors.torch
+            unet_sd = safetensors.torch.load_file(unet_ckpt_path_safetensors)
+        elif os.path.exists(unet_ckpt_path_bin):
+            unet_sd = torch.load(unet_ckpt_path_bin, map_location='cpu', weights_only=True)
+        else:
+            raise FileNotFoundError(f"No checkpoint found at {unet_ckpt_path_safetensors} or {unet_ckpt_path_bin}")
+
+        #unet.load_state_dict(unet_ckpt, strict=True)
+        for name, param in unet.named_parameters():
+            set_module_tensor_to_device(unet, name, device=offload_device, dtype=torch_dtype, value=unet_sd[name])
+
+        vae = AutoencoderKL.from_pretrained(model_path, subfolder="vae", device=device, torch_dtype=torch_dtype)
+        clip = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=torch_dtype)
+        tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+        scheduler = EulerAncestralDiscreteScheduler.from_pretrained(model_path, subfolder="scheduler")
+        feature_extractor = CLIPImageProcessor.from_pretrained(model_path, subfolder="feature_extractor")
+
+        pipeline = HunyuanPaintPipeline(
+            unet=unet,
+            vae = vae,
+            text_encoder=clip,
+            tokenizer=tokenizer,
+            scheduler=scheduler,
+            feature_extractor=feature_extractor,
+            )
+        
+        if compile_args is not None:
+            pipeline.to(device)
+            torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
+            if compile_args["compile_transformer"]:
+                pipeline.unet = torch.compile(pipeline.unet)
+            if compile_args["compile_vae"]:
+                pipeline.vae = torch.compile(pipeline.vae)
+        else:
+            pipeline.enable_model_cpu_offload()
         return (pipeline,)
 
 #region Texture
@@ -301,15 +411,16 @@ class Hy3DRenderMultiView:
             },
             "optional": {
                 "camera_config": ("HY3DCAMERA",),
+                "normal_space": (["world", "tangent"], {"default": "world"}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "MESHRENDER")
-    RETURN_NAMES = ("normal_maps", "position_maps", "renderer")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MESHRENDER", "MASK",)
+    RETURN_NAMES = ("normal_maps", "position_maps", "renderer", "masks")
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, mesh, render_size, texture_size, camera_config=None):
+    def process(self, mesh, render_size, texture_size, camera_config=None, normal_space="world"):
 
         from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
 
@@ -332,24 +443,50 @@ class Hy3DRenderMultiView:
 
         self.render.load_mesh(mesh)
 
-        normal_maps = self.render_normal_multiview(
-            selected_camera_elevs, selected_camera_azims, use_abs_coor=True)
-        normal_tensors = torch.stack(normal_maps, dim=0)
+        if normal_space == "world":
+            normal_maps, masks = self.render_normal_multiview(
+                selected_camera_elevs, selected_camera_azims, use_abs_coor=True)
+            normal_tensors = torch.stack(normal_maps, dim=0)
+            mask_tensors = torch.cat(masks, dim=0)
+        elif normal_space == "tangent":
+            normal_maps, masks = self.render_normal_multiview(
+                selected_camera_elevs, selected_camera_azims, bg_color=[0, 0, 0], use_abs_coor=False)
+            normal_tensors = torch.stack(normal_maps, dim=0)
+            normal_tensors = 2.0 * normal_tensors - 1.0  # Map [0,1] to [-1,1]
+            normal_tensors = normal_tensors / (torch.norm(normal_tensors, dim=-1, keepdim=True) + 1e-6)
+            # Remap axes for standard normal map convention
+            image = torch.zeros_like(normal_tensors)
+            image[..., 0] = normal_tensors[..., 0]  # View right to R
+            image[..., 1] = normal_tensors[..., 1]  # View up to G
+            image[..., 2] = -normal_tensors[..., 2] # View forward (negated) to B
+
+            # Create background color
+            background_color = torch.tensor([0.502, 0.502, 1.0], device=normal_tensors.device) #8080FF
+
+            mask_tensors = torch.cat(masks, dim=0)
+            
+            # Blend rendered image with background
+            
+            normal_tensors = (image + 1) * 0.5
+            normal_tensors = normal_tensors * mask_tensors + background_color * (1 - mask_tensors)
+            
         
         position_maps = self.render_position_multiview(
             selected_camera_elevs, selected_camera_azims)
         position_tensors = torch.stack(position_maps, dim=0)
         
-        return (normal_tensors, position_tensors, self.render,)
+        return (normal_tensors.cpu().float(), position_tensors.cpu().float(), self.render, mask_tensors.squeeze(-1).cpu().float(),)
     
-    def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True):
+    def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True, bg_color=[1, 1, 1]):
         normal_maps = []
+        masks = []
         for elev, azim in zip(camera_elevs, camera_azims):
-            normal_map = self.render.render_normal(
-                elev, azim, use_abs_coor=use_abs_coor, return_type='th')
+            normal_map, mask = self.render.render_normal(
+                elev, azim, bg_color=bg_color, use_abs_coor=use_abs_coor, return_type='th')
             normal_maps.append(normal_map)
+            masks.append(mask)
 
-        return normal_maps
+        return normal_maps, masks
 
     def render_position_multiview(self, camera_elevs, camera_azims):
         position_maps = []
@@ -359,6 +496,90 @@ class Hy3DRenderMultiView:
             position_maps.append(position_map)
 
         return position_maps
+    
+class Hy3DRenderSingleView:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "render_type": (["normal", "depth"], {"default": "normal"}),
+                "render_size": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 16}),
+                "camera_type": (["orth", "perspective"], {"default": "orth"}),
+                "camera_distance": ("FLOAT", {"default": 1.45, "min": 0.1, "max": 10.0, "step": 0.001}),
+                "pan_x": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01}),
+                "pan_y": ("FLOAT", {"default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01}),
+                "ortho_scale": ("FLOAT", {"default": 1.2, "min": 0.1, "max": 10.0, "step": 0.001}),
+                "azimuth": ("FLOAT", {"default": 0, "min": -360, "max": 360, "step": 1}),
+                "elevation": ("FLOAT", {"default": 0, "min": -360, "max": 360, "step": 1}),
+                "bg_color": ("STRING", {"default": "128, 128, 255", "tooltip": "Color as RGB values in range 0-255, separated by commas."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK",)
+    RETURN_NAMES = ("image", "mask", )
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def process(self, mesh, render_type, camera_type, ortho_scale, camera_distance, pan_x, pan_y, render_size, azimuth, elevation, bg_color):
+
+        from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
+
+        bg_color = [int(x.strip())/255.0 for x in bg_color.split(",")]
+
+        self.render = MeshRender(
+            default_resolution=render_size,
+            texture_size=1024,
+            camera_distance=camera_distance,
+            camera_type=camera_type,
+            ortho_scale=ortho_scale,
+            filter_mode='linear'
+            )
+
+        self.render.load_mesh(mesh)
+
+        if render_type == "normal":
+            normals, mask = self.render.render_normal(
+                elevation,
+                azimuth,
+                camera_distance=camera_distance,
+                center=None,
+                resolution=render_size,
+                bg_color=[0, 0, 0],
+                use_abs_coor=False,
+                pan_x=pan_x,
+                pan_y=pan_y
+            )
+
+            normals = 2.0 * normals - 1.0  # Map [0,1] to [-1,1]
+            normals = normals / (torch.norm(normals, dim=-1, keepdim=True) + 1e-6)
+            # Remap axes for standard normal map convention
+            image = torch.zeros_like(normals)
+            image[..., 0] = normals[..., 0]  # View right to R
+            image[..., 1] = normals[..., 1]  # View up to G
+            image[..., 2] = -normals[..., 2] # View forward (negated) to B
+
+            image = (image + 1) * 0.5
+
+            #mask = mask.cpu().float()
+            masked_image = image * mask
+
+            bg_color = torch.tensor(bg_color, dtype=torch.float32, device=image.device)
+            bg = bg_color.view(1, 1, 3) * (1.0 - mask)
+            final_image = masked_image + bg
+        elif render_type == "depth":
+            depth = self.render.render_depth(
+                elevation,
+                azimuth,
+                camera_distance=camera_distance,
+                center=None,
+                resolution=render_size,
+                pan_x=pan_x,
+                pan_y=pan_y
+            )
+            final_image = depth.unsqueeze(0).repeat(1, 1, 1, 3)
+        
+        return (final_image.cpu().float(), mask.squeeze(-1).cpu().float(),)
     
 class Hy3DRenderMultiViewDepth:
     @classmethod
@@ -374,12 +595,15 @@ class Hy3DRenderMultiViewDepth:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", )
-    RETURN_NAMES = ("depth_maps", )
+    RETURN_TYPES = ("IMAGE", "MASK",)
+    RETURN_NAMES = ("depth_maps", "masks", )
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
     def process(self, mesh, render_size, texture_size, camera_config=None):
+
+        mm.unload_all_models()
+        mm.soft_empty_cache()
 
         from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
 
@@ -402,29 +626,80 @@ class Hy3DRenderMultiViewDepth:
 
         self.render.load_mesh(mesh)
 
-       
-
-        depth_maps = self.render_depth_multiview(
+        depth_maps, masks = self.render_depth_multiview(
             selected_camera_elevs, selected_camera_azims)
         depth_tensors = torch.stack(depth_maps, dim=0)
-        depth_tensors = depth_tensors.repeat(1, 1, 1, 3)
+        depth_tensors = depth_tensors.repeat(1, 1, 1, 3).cpu().float()
+        masks = torch.cat(masks, dim=0).squeeze(-1).cpu().float()
         
-        return (depth_tensors,)
+        return (depth_tensors, masks,)
     
     def render_depth_multiview(self, camera_elevs, camera_azims):
         depth_maps = []
+        masks = []
         for elev, azim in zip(camera_elevs, camera_azims):        
-            depth_map = self.render.render_depth(elev, azim, return_type='th')
+            depth_map, mask = self.render.render_depth(elev, azim, return_type='th')
             depth_maps.append(depth_map)
+            masks.append(mask)
 
-        return depth_maps
+        return depth_maps, masks
+
+class Hy3DDiffusersSchedulerConfig:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "pipeline": ("HY3DDIFFUSERSPIPE",),
+                "scheduler": (available_schedulers,
+                    {
+                        "default": 'Euler A'
+                    }),
+                "sigmas": (["default", "karras", "exponential", "beta"],),
+            },
+        }
+
+    RETURN_TYPES = ("NOISESCHEDULER",)
+    RETURN_NAMES = ("diffusers_scheduler",)
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def process(self, pipeline, scheduler, sigmas):
+
+        scheduler_config = dict(pipeline.scheduler.config)
+        
+        if scheduler in scheduler_mapping:
+            if scheduler == "DPM++SDE":
+                scheduler_config["algorithm_type"] = "sde-dpmsolver++"
+            else:
+                scheduler_config.pop("algorithm_type", None)
+            if sigmas == "default":
+                scheduler_config["use_karras_sigmas"] = False
+                scheduler_config["use_exponential_sigmas"] = False
+                scheduler_config["use_beta_sigmas"] = False
+            elif sigmas == "karras":
+                scheduler_config["use_karras_sigmas"] = True
+                scheduler_config["use_exponential_sigmas"] = False
+                scheduler_config["use_beta_sigmas"] = False
+            elif sigmas == "exponential":
+                scheduler_config["use_karras_sigmas"] = False
+                scheduler_config["use_exponential_sigmas"] = True
+                scheduler_config["use_beta_sigmas"] = False
+            elif sigmas == "beta":
+                scheduler_config["use_karras_sigmas"] = False
+                scheduler_config["use_exponential_sigmas"] = False
+                scheduler_config["use_beta_sigmas"] = True
+            noise_scheduler = scheduler_mapping[scheduler].from_config(scheduler_config)
+        else:
+            raise ValueError(f"Unknown scheduler: {scheduler}")
+        
+        return (noise_scheduler,)
     
 class Hy3DSampleMultiView:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "pipeline": ("HY3DPAINTMODEL",),
+                "pipeline": ("HY3DDIFFUSERSPIPE",),
                 "ref_image": ("IMAGE", ),
                 "normal_maps": ("IMAGE", ),
                 "position_maps": ("IMAGE", ),
@@ -434,6 +709,9 @@ class Hy3DSampleMultiView:
             },
             "optional": {
                 "camera_config": ("HY3DCAMERA",),
+                "scheduler": ("NOISESCHEDULER",),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "samples": ("LATENT", ),
             }
         }
 
@@ -442,8 +720,10 @@ class Hy3DSampleMultiView:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, pipeline, ref_image, normal_maps, position_maps, view_size, seed, steps, camera_config=None):
+    def process(self, pipeline, ref_image, normal_maps, position_maps, view_size, seed, steps, 
+                camera_config=None, scheduler=None, denoise_strength=1.0, samples=None):
         device = mm.get_torch_device()
+        mm.unload_all_models()
         mm.soft_empty_cache()
         torch.manual_seed(seed)
         generator=torch.Generator(device=pipeline.device).manual_seed(seed)
@@ -462,7 +742,7 @@ class Hy3DSampleMultiView:
         camera_info = [(((azim // 30) + 9) % 12) // {-90: 3, -45: 2, -20: 1, 0: 1, 20: 1, 45: 2, 90: 3}[
             elev] + {-90: 36, -45: 30, -20: 0, 0: 12, 20: 24, 45: 30, 90: 40}[elev] for azim, elev in
                     zip(selected_camera_azims, selected_camera_elevs)]
-        print(camera_info)
+        #print(camera_info)
         
         normal_maps_np = (normal_maps * 255).to(torch.uint8).cpu().numpy()
         normal_maps_pil = [Image.fromarray(normal_map) for normal_map in normal_maps_np]
@@ -483,11 +763,20 @@ class Hy3DSampleMultiView:
 
         callback = ComfyProgressCallback(total_steps=steps)
 
+        if scheduler is not None:
+            if not hasattr(self, "default_scheduler"):
+                self.default_scheduler = pipeline.scheduler
+            pipeline.scheduler = scheduler
+        else:
+            if hasattr(self, "default_scheduler"):
+                pipeline.scheduler = self.default_scheduler
+
         multiview_images = pipeline(
             input_image,
             width=view_size,
             height=view_size,
             generator=generator,
+            latents=samples["samples"] if samples is not None else None,
             num_in_batch = num_view,
             camera_info_gen = [camera_info],
             camera_info_ref = [[0]],
@@ -496,7 +785,8 @@ class Hy3DSampleMultiView:
             num_inference_steps=steps,
             output_type="pt",
             callback_on_step_end=callback,
-            callback_on_step_end_tensor_inputs=["latents", "prompt_embeds", "negative_prompt_embeds"]
+            callback_on_step_end_tensor_inputs=["latents", "prompt_embeds", "negative_prompt_embeds"],
+            denoise_strength=denoise_strength
             ).images
 
         out_tensors = multiview_images.permute(0, 2, 3, 1).cpu().float()
@@ -693,6 +983,43 @@ class Hy3DLoadMesh:
         
         return (mesh,)
 
+class Hy3DUploadMesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        mesh_extensions = ['glb', 'gltf', 'obj', 'ply', 'stl', '3mf']
+        input_dir = folder_paths.get_input_directory()
+        files = []
+        for f in os.listdir(input_dir):
+            if os.path.isfile(os.path.join(input_dir, f)):
+                file_parts = f.split('.')
+                if len(file_parts) > 1 and (file_parts[-1] in mesh_extensions):
+                    files.append(f)
+        return {
+            "required": {
+                "mesh": (sorted(files),),
+            }
+        }
+    RETURN_TYPES = ("HY3DMESH",)
+    RETURN_NAMES = ("mesh",)
+    OUTPUT_TOOLTIPS = ("The glb model with mesh to texturize.",)
+    
+    FUNCTION = "load"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Loads a glb model from the given path."
+
+    def load(self, mesh):
+        import trimesh
+        path = mesh.strip()
+        if path.startswith("\""):
+            path = path[1:]
+        if path.endswith("\""):
+            path = path[:-1]
+        mesh_file = folder_paths.get_annotated_filepath(path)
+        loaded_mesh = trimesh.load(mesh_file, force="mesh")
+        
+        return (loaded_mesh,)
+
+
 class Hy3DGenerateMesh:
     @classmethod
     def INPUT_TYPES(s):
@@ -716,6 +1043,9 @@ class Hy3DGenerateMesh:
 
     def process(self, pipeline, image, steps, guidance_scale, seed, mask=None):
 
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
@@ -724,6 +1054,8 @@ class Hy3DGenerateMesh:
 
         if mask is not None:
             mask = mask.unsqueeze(0).to(device)
+            if mask.shape[2] != image.shape[2] or mask.shape[3] != image.shape[3]:
+                mask = F.interpolate(mask, size=(image.shape[2], image.shape[3]), mode='nearest')
 
         pipeline.to(device)
 
@@ -758,7 +1090,7 @@ class Hy3DVAEDecode:
                 "latents": ("HY3DLATENT", ),
                 "box_v": ("FLOAT", {"default": 1.01, "min": -10.0, "max": 10.0, "step": 0.001}),
                 "octree_resolution": ("INT", {"default": 384, "min": 64, "max": 4096, "step": 16}),
-                "num_chunks": ("INT", {"default": 8000, "min": 1, "max": 10000000, "step": 1}),
+                "num_chunks": ("INT", {"default": 8000, "min": 1, "max": 10000000, "step": 1, "tooltip": "Number of chunks to process at once, higher values use more memory, but make the process faster"}),
                 "mc_level": ("FLOAT", {"default": 0, "min": -1.0, "max": 1.0, "step": 0.0001}),
                 "mc_algo": (["mc", "dmc"], {"default": "mc"}),
             },
@@ -828,6 +1160,123 @@ class Hy3DPostprocessMesh:
         if smooth_normals:              
             new_mesh.vertex_normals = trimesh.smoothing.get_vertices_normals(new_mesh)
 
+        
+        return (new_mesh, )
+
+class Hy3DFastSimplifyMesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "target_count": ("INT", {"default": 40000, "min": 1, "max": 100000000, "step": 1, "tooltip": "Target number of triangles"}),
+                "aggressiveness": ("INT", {"default": 7, "min": 0, "max": 100, "step": 1, "tooltip": "Parameter controlling the growth rate of the threshold at each iteration when lossless is False."}),
+                "max_iterations": ("INT", {"default": 100, "min": 1, "max": 1000, "step": 1, "tooltip": "Maximal number of iterations"}),
+                "update_rate": ("INT", {"default": 5, "min": 1, "max": 1000, "step": 1, "tooltip": "Number of iterations between each update"}),
+                "preserve_border": ("BOOLEAN", {"default": True, "tooltip": "Flag for preserving the vertices situated on open borders."}),
+                "lossless": ("BOOLEAN", {"default": False, "tooltip": "Flag for using the lossless simplification method. Sets the update rate to 1"}),
+                "threshold_lossless": ("FLOAT", {"default": 1e-3, "min": 0.0, "max": 1.0, "step": 0.0001, "tooltip": "Threshold for the lossless simplification method."}),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH",)
+    RETURN_NAMES = ("mesh",)
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Simplifies the mesh using Fast Quadric Mesh Reduction: https://github.com/Kramer84/pyfqmr-Fast-Quadric-Mesh-Reduction"
+
+    def process(self, mesh, target_count, aggressiveness, preserve_border, max_iterations,lossless, threshold_lossless, update_rate):
+        new_mesh = mesh.copy()
+        try:
+            import pyfqmr
+        except ImportError:
+            raise ImportError("pyfqmr not found. Please install it using 'pip install pyfqmr' https://github.com/Kramer84/pyfqmr-Fast-Quadric-Mesh-Reduction")
+        
+        mesh_simplifier = pyfqmr.Simplify()
+        mesh_simplifier.setMesh(mesh.vertices, mesh.faces)
+        mesh_simplifier.simplify_mesh(
+            target_count=target_count, 
+            aggressiveness=aggressiveness,
+            update_rate=update_rate,
+            max_iterations=max_iterations,
+            preserve_border=preserve_border, 
+            verbose=True,
+            lossless=lossless,
+            threshold_lossless=threshold_lossless
+            )
+        new_mesh.vertices, new_mesh.faces, _ = mesh_simplifier.getMesh()
+        log.info(f"Simplified mesh to {target_count} vertices, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")   
+        
+        return (new_mesh, )
+    
+class Hy3DMeshInfo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH", "INT", "INT", )
+    RETURN_NAMES = ("mesh", "vertices", "faces",)
+    FUNCTION = "process"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def process(self, mesh):
+        vertices_count = mesh.vertices.shape[0]
+        faces_count = mesh.faces.shape[0]
+        log.info(f"Hy3DMeshInfo: Mesh has {vertices_count} vertices and {mesh.faces.shape[0]} faces")
+        return {"ui": {
+            "text": [f"{vertices_count:,.0f}x{faces_count:,.0f}"]}, 
+            "result": (mesh, vertices_count, faces_count) 
+        }
+    
+class Hy3DIMRemesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "merge_vertices": ("BOOLEAN", {"default": True}),
+                "vertex_count": ("INT", {"default": 10000, "min": 100, "max": 10000000, "step": 1}),
+                "smooth_iter": ("INT", {"default": 8, "min": 0, "max": 100, "step": 1}),
+                "align_to_boundaries": ("BOOLEAN", {"default": True}),
+                "triangulate_result": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("HY3DMESH",)
+    RETURN_NAMES = ("mesh",)
+    FUNCTION = "remesh"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Remeshes the mesh using instant-meshes: https://github.com/wjakob/instant-meshes, Note: this will remove all vertex colors and textures."
+
+    def remesh(self, mesh, merge_vertices, vertex_count, smooth_iter, align_to_boundaries, triangulate_result):
+        try:
+            import pynanoinstantmeshes as PyNIM
+        except ImportError:
+            raise ImportError("pynanoinstantmeshes not found. Please install it using 'pip install pynanoinstantmeshes'")
+        import trimesh
+        new_mesh = mesh.copy()
+        if merge_vertices:
+            mesh.merge_vertices(new_mesh)
+
+        new_verts, new_faces = PyNIM.remesh(
+            np.array(mesh.vertices, dtype=np.float32),
+            np.array(mesh.faces, dtype=np.uint32),
+            vertex_count,
+            align_to_boundaries=align_to_boundaries,
+            smooth_iter=smooth_iter
+        )
+        if new_verts.shape[0] - 1 != new_faces.max():
+            # Skip test as the meshing failed
+            raise ValueError("Instant-meshes failed to remesh the mesh")
+        new_verts = new_verts.astype(np.float32)
+        if triangulate_result:
+            new_faces = trimesh.geometry.triangulate_quads(new_faces)
+
+        new_mesh = trimesh.Trimesh(new_verts, new_faces)
         
         return (new_mesh, )
     
@@ -945,6 +1394,10 @@ class Hy3DExportMesh:
             "required": {
                 "mesh": ("HY3DMESH",),
                 "filename_prefix": ("STRING", {"default": "3D/Hy3D"}),
+                "file_format": (["glb", "obj", "ply", "stl", "3mf", "dae"],),
+            },
+            "optional": {
+                "save_file": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -953,15 +1406,165 @@ class Hy3DExportMesh:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, mesh, filename_prefix):
+    def process(self, mesh, filename_prefix, file_format, save_file=True):
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, folder_paths.get_output_directory())
-        output_glb_path = Path(full_output_folder, f'{filename}_{counter:05}_.glb')
+        output_glb_path = Path(full_output_folder, f'{filename}_{counter:05}_.{file_format}')
         output_glb_path.parent.mkdir(exist_ok=True)
-        mesh.export(output_glb_path)
-
-        relative_path = Path(subfolder) / f'{filename}_{counter:05}_.glb'
+        if save_file:
+            mesh.export(output_glb_path, file_type=file_format)
+            relative_path = Path(subfolder) / f'{filename}_{counter:05}_.{file_format}'
+        else:
+            temp_file = Path(full_output_folder, f'hy3dtemp_.{file_format}')
+            mesh.export(temp_file, file_type=file_format)
+            relative_path = Path(subfolder) / f'hy3dtemp_.{file_format}'
         
         return (str(relative_path), )
+    
+class Hy3DNvdiffrastRenderer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("HY3DMESH",),
+                "render_type": (["textured", "vertex_colors", "normals","depth",],),
+                "width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16, "tooltip": "Width of the rendered image"}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16, "tooltip": "Height of the rendered image"}),
+                "ssaa": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1, "tooltip": "Super-sampling anti-aliasing"}),
+                "num_frames": ("INT", {"default": 30, "min": 1, "max": 1000, "step": 1, "tooltip": "Number of frames to render"}),
+                "camera_distance": ("FLOAT", {"default": 2.0, "min": -100.1, "max": 1000.0, "step": 0.01, "tooltip": "Camera distance from the object"}),
+                "yaw": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.01, "tooltip": "Start yaw in radians"}),
+                "pitch": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.01, "tooltip": "Start pitch in radians"}),
+                "fov": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 179.0, "step": 0.01, "tooltip": "Camera field of view in degrees"}),
+                "near": ("FLOAT", {"default": 0.1, "min": 0.001, "max": 1000.0, "step": 0.01, "tooltip": "Camera near clipping plane"}),
+                "far": ("FLOAT", {"default": 1000.0, "min": 1.0, "max": 10000.0, "step": 0.01, "tooltip": "Camera far clipping plane"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK",)
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "render"
+    CATEGORY = "Hunyuan3DWrapper"
+
+    def render(self, mesh, width, height, camera_distance, yaw, pitch, fov, near, far, num_frames, ssaa, render_type):
+        try:
+            import nvdiffrast.torch as dr
+        except ImportError:
+            raise ImportError("nvdiffrast not found. Please install it https://github.com/NVlabs/nvdiffrast")
+        try:
+            from .utils import rotate_mesh_matrix, yaw_pitch_r_fov_to_extrinsics_intrinsics, intrinsics_to_projection
+        except ImportError:
+            raise ImportError("utils3d not found. Please install it 'pip install git+https://github.com/EasternJournalist/utils3d.git#egg=utils3d'")
+        # Create GL context
+        device = mm.get_torch_device()
+        glctx = dr.RasterizeCudaContext()
+        mesh_copy = mesh.copy()
+        mesh_copy = rotate_mesh_matrix(mesh_copy, 90, 'x')
+        mesh_copy = rotate_mesh_matrix(mesh_copy, 180, 'z')
+
+        width, height = width * ssaa, height * ssaa
+
+        # Get UV coordinates and texture if available
+        if hasattr(mesh_copy.visual, 'uv') and hasattr(mesh_copy.visual, 'material'):
+            uvs = torch.tensor(mesh_copy.visual.uv, dtype=torch.float32, device=device).contiguous()
+            
+            # Get texture from material
+            if hasattr(mesh_copy.visual.material, 'baseColorTexture'):
+                pil_texture = getattr(mesh_copy.visual.material, "baseColorTexture")
+            elif hasattr(mesh_copy.visual.material, 'image'):
+                pil_texture = getattr(mesh_copy.visual.material, "image")
+            pil_texture = pil_texture.transpose(Image.FLIP_TOP_BOTTOM)
+
+            # Convert PIL to tensor [B,C,H,W]
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+            ])
+            texture = transform(pil_texture).to(device)
+            texture = texture.unsqueeze(0).permute(0, 2, 3, 1).contiguous() #need to be contiguous for nvdiffrast
+        else:
+            log.warning("No texture found")
+            # Fallback to vertex colors if no texture
+            uvs = None
+            texture = None
+        
+        # Get vertices and faces from trimesh
+        vertices = torch.tensor(mesh_copy.vertices, dtype=torch.float32, device=device).unsqueeze(0)
+        faces = torch.tensor(mesh_copy.faces, dtype=torch.int32, device=device)
+        
+        yaws = torch.linspace(yaw, yaw + torch.pi * 2, num_frames) 
+        pitches = [pitch] * num_frames
+        yaws = yaws.tolist()
+
+        r = camera_distance
+        extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitches,  r, fov)
+        
+        image_list = []
+        mask_list = []
+        pbar = ProgressBar(num_frames)
+        for j, (extr, intr) in tqdm(enumerate(zip(extrinsics, intrinsics)), desc='Rendering', disable=False):
+            
+            perspective = intrinsics_to_projection(intr, near, far)
+            RT = extr.unsqueeze(0)
+            full_proj = (perspective @ extr).unsqueeze(0)
+            
+            # Transform vertices to clip space
+            vertices_homo = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1)
+            vertices_camera = torch.bmm(vertices_homo, RT.transpose(-1, -2))
+            vertices_clip = torch.bmm(vertices_homo, full_proj.transpose(-1, -2))
+            
+            # Rasterize with proper shape [batch=1, num_vertices, 4]
+            rast_out, _ = dr.rasterize(glctx, vertices_clip, faces, (height, width))
+            
+            if render_type == "textured":
+                if uvs is not None and texture is not None:
+                    # Interpolate UV coordinates
+                    uv_attr, _= dr.interpolate(uvs.unsqueeze(0), rast_out, faces)
+                    
+                    # Sample texture using interpolated UVs
+                    image = dr.texture(tex=texture, uv=uv_attr)
+                    image = dr.antialias(image, rast_out, vertices_clip, faces)
+                else:
+                    raise Exception("No texture found")
+            elif render_type == "vertex_colors":
+                # Fallback to vertex color rendering
+                vertex_colors = (vertices - vertices.min()) / (vertices.max() - vertices.min())
+                image = dr.interpolate(vertex_colors, rast_out, faces)[0]
+            elif render_type == "depth":
+                depth_values = vertices_camera[..., 2:3].contiguous()
+                depth_values = (depth_values - depth_values.min()) / (depth_values.max() - depth_values.min())
+                depth_values = 1 - depth_values
+                image = dr.interpolate(depth_values, rast_out, faces)[0]
+                image = dr.antialias(image, rast_out, vertices_clip, faces)
+            elif "normals" in render_type:
+                normals_tensor = torch.tensor(mesh_copy.vertex_normals, dtype=torch.float32, device=device).contiguous()
+                faces_tensor = torch.tensor(mesh_copy.faces, dtype=torch.int32, device=device).contiguous()
+                normal_image_tensors = dr.interpolate(normals_tensor, rast_out, faces_tensor)[0]
+                normal_image_tensors = dr.antialias(normal_image_tensors, rast_out, vertices_clip, faces)
+                normal_image_tensors = torch.nn.functional.normalize(normal_image_tensors, dim=-1)
+                image = (normal_image_tensors + 1) * 0.5
+
+            # Create background color
+            background_color = torch.zeros((1, height, width, 3), device=device)
+            
+            # Get alpha mask from rasterization
+            mask = rast_out[..., -1:]
+            mask = (mask > 0).float()
+            
+            # Blend rendered image with background
+            image = image * mask + background_color * (1 - mask)
+
+            image_list.append(image)
+            mask_list.append(mask)
+            
+            pbar.update(1)
+        import torch.nn.functional as F
+        image_out = torch.cat(image_list, dim=0)
+        if ssaa > 1:
+            image_out = F.interpolate(image_out.permute(0, 3, 1, 2), (width, height), mode='bilinear', align_corners=False, antialias=True)
+            image_out = image_out.permute(0, 2, 3, 1)
+        mask_out = torch.cat(mask_list, dim=0).squeeze(-1)
+     
+        
+        return (image_out.cpu().float(), mask_out.cpu().float(),)
 
 NODE_CLASS_MAPPINGS = {
     "Hy3DModelLoader": Hy3DModelLoader,
@@ -975,6 +1578,7 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DTorchCompileSettings": Hy3DTorchCompileSettings,
     "Hy3DPostprocessMesh": Hy3DPostprocessMesh,
     "Hy3DLoadMesh": Hy3DLoadMesh,
+    "Hy3DUploadMesh": Hy3DUploadMesh,
     "Hy3DCameraConfig": Hy3DCameraConfig,
     "Hy3DMeshUVWrap": Hy3DMeshUVWrap,
     "Hy3DSampleMultiView": Hy3DSampleMultiView,
@@ -985,7 +1589,13 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DGetMeshPBRTextures": Hy3DGetMeshPBRTextures,
     "Hy3DSetMeshPBRTextures": Hy3DSetMeshPBRTextures,
     "Hy3DSetMeshPBRAttributes": Hy3DSetMeshPBRAttributes,
-    "Hy3DVAEDecode": Hy3DVAEDecode
+    "Hy3DVAEDecode": Hy3DVAEDecode,
+    "Hy3DRenderSingleView": Hy3DRenderSingleView,
+    "Hy3DDiffusersSchedulerConfig": Hy3DDiffusersSchedulerConfig,
+    "Hy3DIMRemesh": Hy3DIMRemesh,
+    "Hy3DMeshInfo": Hy3DMeshInfo,
+    "Hy3DFastSimplifyMesh": Hy3DFastSimplifyMesh,
+    "Hy3DNvdiffrastRenderer": Hy3DNvdiffrastRenderer
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DModelLoader": "Hy3DModelLoader",
@@ -999,6 +1609,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DTorchCompileSettings": "Hy3D Torch Compile Settings",
     "Hy3DPostprocessMesh": "Hy3D Postprocess Mesh",
     "Hy3DLoadMesh": "Hy3D Load Mesh",
+    "Hy3DUploadMesh": "Hy3D Upload Mesh",
     "Hy3DCameraConfig": "Hy3D Camera Config",
     "Hy3DMeshUVWrap": "Hy3D Mesh UV Wrap",
     "Hy3DSampleMultiView": "Hy3D Sample MultiView",
@@ -1009,5 +1620,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DGetMeshPBRTextures": "Hy3D Get Mesh PBR Textures",
     "Hy3DSetMeshPBRTextures": "Hy3D Set Mesh PBR Textures",
     "Hy3DSetMeshPBRAttributes": "Hy3D Set Mesh PBR Attributes",
-    "Hy3DVAEDecode": "Hy3D VAE Decode"
+    "Hy3DVAEDecode": "Hy3D VAE Decode",
+    "Hy3DRenderSingleView": "Hy3D Render SingleView",
+    "Hy3DDiffusersSchedulerConfig": "Hy3D Diffusers Scheduler Config",
+    "Hy3DIMRemesh": "Hy3D Instant-Meshes Remesh",
+    "Hy3DMeshInfo": "Hy3D Mesh Info",
+    "Hy3DFastSimplifyMesh": "Hy3D Fast Simplify Mesh",
+    "Hy3DNvdiffrastRenderer": "Hy3D Nvdiffrast Renderer"
     }
