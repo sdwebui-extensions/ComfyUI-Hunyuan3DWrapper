@@ -1,13 +1,3 @@
-# Open Source Model Licensed under the Apache License Version 2.0
-# and Other Licenses of the Third-Party Components therein:
-# The below Model in this distribution may have been modified by THL A29 Limited
-# ("Tencent Modifications"). All Tencent Modifications are Copyright (C) 2024 THL A29 Limited.
-
-# Copyright (C) 2024 THL A29 Limited, a Tencent company.  All rights reserved.
-# The below software and/or models in this distribution may have been
-# modified by THL A29 Limited ("Tencent Modifications").
-# All Tencent Modifications are Copyright (C) THL A29 Limited.
-
 # Hunyuan 3D is licensed under the TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
 # except for the third-party components listed below.
 # Hunyuan 3D does not impose any additional limitations beyond what is outlined
@@ -25,9 +15,10 @@
 import tempfile
 import os
 from typing import Union
+import torch
+import numpy as np
 
-
-from .models.vae import Latent2MeshOutput
+from .models.autoencoders import Latent2MeshOutput
 
 import folder_paths
 
@@ -43,7 +34,10 @@ def load_mesh(path):
     return mesh
 
 
-def reduce_face(mesh, max_facenum: int = 200000):
+def reduce_face(mesh, max_facenum):
+    if max_facenum > mesh.current_mesh().face_number():
+        return mesh
+
     mesh.apply_filter(
         "meshing_decimation_quadric_edge_collapse",
         targetfacenum=max_facenum,
@@ -164,6 +158,85 @@ def import_mesh(mesh: Union[Latent2MeshOutput, str]):
 
     return mesh
 
+def bpt_remesh(self, mesh, verbose: bool = False, with_normal: bool = True, temperature: float = 0.5, batch_size: int = 1, pc_num: int = 4096, seed: int = 1234, samples: int = 50000):
+        from .bpt.model import data_utils
+        from .bpt.model.model import MeshTransformer
+        from .bpt.model.serializaiton import BPT_deserialize
+        from .bpt.utils import sample_pc, joint_filter
+
+        pc_normal = sample_pc(mesh, pc_num=pc_num, with_normal=with_normal, seed=seed, samples=samples)
+
+        pc_normal = pc_normal[None, :, :] if len(pc_normal.shape) == 2 else pc_normal
+
+        from torch.serialization import add_safe_globals
+        from deepspeed.runtime.fp16.loss_scaler import LossScaler
+        from deepspeed.runtime.zero.config import ZeroStageEnum
+        from deepspeed.utils.tensor_fragment import fragment_address
+
+        add_safe_globals([LossScaler, fragment_address, ZeroStageEnum])
+
+        model = MeshTransformer()
+
+        comfyui_dir = os.path.dirname(os.path.abspath(__file__)) 
+        model_path = os.path.join(comfyui_dir, 'bpt/bpt-8-16-500m.pt')
+        print(model_path)
+        model.load(model_path)
+        model = model.eval().cuda().half()
+
+        import torch
+        pc_tensor = torch.from_numpy(pc_normal).cuda().half()
+        if len(pc_tensor.shape) == 2:
+            pc_tensor = pc_tensor.unsqueeze(0)
+
+        codes = model.generate(
+            pc=pc_tensor,
+            filter_logits_fn=joint_filter,
+            filter_kwargs=dict(k=50, p=0.95),
+            return_codes=True,
+            temperature=temperature,
+            batch_size=batch_size,
+        )
+        
+        coords = []
+        try:
+            for i in range(len(codes)):
+                code = codes[i]
+                code = code[code != model.pad_id].cpu().numpy()
+                vertices = BPT_deserialize(
+                    code,
+                    block_size=model.block_size,
+                    offset_size=model.offset_size,
+                    use_special_block=model.use_special_block,
+                )
+                coords.append(vertices)
+        except:
+            coords.append(np.zeros(3, 3))
+
+        vertices = coords[i]
+        faces = torch.arange(1, len(vertices) + 1).view(-1, 3)
+
+        # Move to CPU
+        faces = faces.cpu().numpy()
+
+        del model
+
+        return data_utils.to_mesh(vertices, faces, transpose=False, post_process=True)
+
+        
+class BptMesh:
+    def __call__(
+        self,
+        mesh,
+        temperature: float = 0.5,
+        batch_size: int = 1,
+        with_normal: bool = True,
+        verbose: bool = False,
+        pc_num: int = 4096,
+        seed: int = 1234,
+        samples: int = 50000
+    ):
+        mesh = bpt_remesh(self, mesh=mesh, temperature=temperature, batch_size=batch_size, with_normal=with_normal, pc_num=pc_num, seed=seed, samples=samples)
+        return mesh
 
 class FaceReducer:
     def __call__(
@@ -215,3 +288,48 @@ class DegenerateFaceRemover:
 
         mesh = export_mesh(mesh, ms)
         return mesh
+
+
+def mesh_normalize(mesh):
+    """
+    Normalize mesh vertices to sphere
+    """
+    scale_factor = 1.2
+    vtx_pos = np.asarray(mesh.vertices)
+    max_bb = (vtx_pos - 0).max(0)[0]
+    min_bb = (vtx_pos - 0).min(0)[0]
+
+    center = (max_bb + min_bb) / 2
+
+    scale = torch.norm(torch.tensor(vtx_pos - center, dtype=torch.float32), dim=1).max() * 2.0
+
+    vtx_pos = (vtx_pos - center) * (scale_factor / float(scale))
+    mesh.vertices = vtx_pos
+
+    return mesh
+
+
+class MeshSimplifier:
+    def __init__(self, executable: str = None):
+        if executable is None:
+            CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+            executable = os.path.join(CURRENT_DIR, "mesh_simplifier.bin")
+        self.executable = executable
+
+    def __call__(
+        self,
+        mesh,
+    ):
+        import trimesh
+        with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as temp_input:
+            with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as temp_output:
+                mesh.export(temp_input.name)
+                os.system(f'{self.executable} {temp_input.name} {temp_output.name}')
+                ms = trimesh.load(temp_output.name, process=False)
+                if isinstance(ms, trimesh.Scene):
+                    combined_mesh = trimesh.Trimesh()
+                    for geom in ms.geometry.values():
+                        combined_mesh = trimesh.util.concatenate([combined_mesh, geom])
+                    ms = combined_mesh
+                ms = mesh_normalize(ms)
+                return ms

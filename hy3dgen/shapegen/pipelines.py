@@ -44,6 +44,7 @@ import comfy.model_management as mm
 
 logger = logging.getLogger(__name__)
 
+from .schedulers import FlowMatchEulerDiscreteScheduler, ConsistencyFlowMatchEulerDiscreteScheduler
 
 def retrieve_timesteps(
     scheduler,
@@ -147,7 +148,6 @@ class Hunyuan3DDiTPipeline:
     def from_single_file(
         cls,
         ckpt_path,
-        config_path,
         device='cuda',
         offload_device=torch.device('cpu'),
         dtype=torch.float16,
@@ -155,11 +155,9 @@ class Hunyuan3DDiTPipeline:
         compile_args=None,
         attention_mode="sdpa",
         cublas_ops=False,
+        scheduler="FlowMatchEulerDiscreteScheduler", 
         **kwargs,
     ):
-        # load config
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
 
         # load ckpt
         if use_safetensors:
@@ -182,6 +180,23 @@ class Hunyuan3DDiTPipeline:
         else:
             ckpt = torch.load(ckpt_path, map_location='cpu')
 
+        script_directory = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # load config
+
+        single_block_nums = set()
+        for k in ckpt["model"].keys():
+            if k.startswith('single_blocks.'):
+                block_num = int(k.split('.')[1])
+                single_block_nums.add(block_num)
+    
+        if len(single_block_nums) < 17:
+            config_path = os.path.join(script_directory, "configs", "dit_config_mini.yaml")
+            logger.info(f"Model has {len(single_block_nums)} single blocks, setting config to dit_config_mini.yaml")
+        else:
+            config_path = os.path.join(script_directory, "configs", "dit_config.yaml")
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
         
         # load model
         if "guidance_in.in_layer.bias" in ckpt['model']: #guidance_in.in_layer.bias
@@ -189,10 +204,10 @@ class Hunyuan3DDiTPipeline:
             config['model']['params']['guidance_embed'] = True
             config['conditioner']['params']['main_image_encoder']['kwargs']['has_guidance_embed'] = True
         config['model']['params']['attention_mode'] = attention_mode
-        config['vae']['params']['attention_mode'] = attention_mode
+        #config['vae']['params']['attention_mode'] = attention_mode
 
-        if cublas_ops:
-            config['vae']['params']['cublas_ops'] = True
+        #if cublas_ops:
+        #    config['vae']['params']['cublas_ops'] = True
         
         with init_empty_weights():
             model = instantiate_from_config(config['model'])
@@ -211,7 +226,13 @@ class Hunyuan3DDiTPipeline:
                 set_module_tensor_to_device(conditioner, name, device=offload_device, dtype=dtype, value=ckpt['conditioner'][name])
 
         image_processor = instantiate_from_config(config['image_processor'])
-        scheduler = instantiate_from_config(config['scheduler'])
+
+        if scheduler == "FlowMatchEulerDiscreteScheduler":
+            scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+        elif scheduler == "ConsistencyFlowMatchEulerDiscreteScheduler":
+            scheduler = ConsistencyFlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, pcm_timesteps=100)
+        
+        #scheduler = instantiate_from_config(config['scheduler'])
 
         if compile_args is not None:
             torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
@@ -311,10 +332,10 @@ class Hunyuan3DDiTPipeline:
             self.model.to(dtype=dtype)
             self.conditioner.to(dtype=dtype)
 
-    def encode_cond(self, image, mask, do_classifier_free_guidance, dual_guidance):
+    def encode_cond(self, image, mask, do_classifier_free_guidance, dual_guidance, view_dict=None):
         self.conditioner.to(self.main_device)
-        bsz = image.shape[0]
-        cond = self.conditioner(image=image, mask=mask)
+        bsz = 1
+        cond = self.conditioner(image=image, mask=mask, view_dict=view_dict)
 
         if do_classifier_free_guidance:
             un_cond = self.conditioner.unconditional_embedding(bsz)
@@ -575,6 +596,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
         # num_chunks=8000,
         # output_type: Optional[str] = "trimesh",
         enable_pbar=True,
+        view_dict=None,
         **kwargs,
     ):
         callback = kwargs.pop("callback", None)
@@ -594,8 +616,9 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
             mask=mask,
             do_classifier_free_guidance=do_classifier_free_guidance,
             dual_guidance=False,
+            view_dict=view_dict
         )
-        batch_size = image.shape[0]
+        batch_size = 1
 
         # 5. Prepare timesteps
         # NOTE: this is slightly different from common usage, we start from 0.
