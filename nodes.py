@@ -305,6 +305,7 @@ class DownloadAndLoadHy3DPaintModel:
         from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
         from accelerate import init_empty_weights
         from accelerate.utils import set_module_tensor_to_device
+        from diffusers import EulerAncestralDiscreteScheduler
 
         download_path = os.path.join(folder_paths.models_dir,"diffusers")
         model_path = os.path.join(download_path, model)
