@@ -1037,11 +1037,62 @@ class Hy3DLoadMesh:
     DESCRIPTION = "Loads a glb model from the given path."
 
     def load(self, glb_path):
+
+        if not os.path.exists(glb_path):
+            glb_path = os.path.join(folder_paths.get_input_directory(), glb_path)
         import trimesh as Trimesh
         
         trimesh = Trimesh.load(glb_path, force="mesh")
         
         return (trimesh,)
+
+
+class TrimeshToMESH:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh": ("TRIMESH",),
+            }
+        }
+    RETURN_TYPES = ("MESH",)
+    OUTPUT_TOOLTIPS = ("MESH object containing vertices and faces as torch tensors.",)
+    
+    FUNCTION = "load"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Converts trimesh object to ComfyUI MESH object, which only includes mesh data"
+
+    def load(self, trimesh):
+
+        vertices = torch.tensor(trimesh.vertices, dtype=torch.float32)
+        faces = torch.tensor(trimesh.faces, dtype=torch.float32)
+        mesh = (self.MESH(vertices.unsqueeze(0), faces.unsqueeze(0)))
+        
+        return (mesh,)
+
+    class MESH:
+        def __init__(self, vertices, faces):
+            self.vertices = vertices
+            self.faces = faces
+
+class MESHToTrimesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mesh": ("MESH",),
+            }
+        }
+    RETURN_TYPES = ("TRIMESH",)
+    OUTPUT_TOOLTIPS = ("TRIMESH object containing vertices and faces as torch tensors.",)
+    
+    FUNCTION = "load"
+    CATEGORY = "Hunyuan3DWrapper"
+    DESCRIPTION = "Converts trimesh object to ComfyUI MESH object, which only includes mesh data"
+
+    def load(self, mesh):
+        mesh_output = Trimesh.Trimesh(mesh.vertices[0], mesh.faces[0])
+        return (mesh_output,)
 
 class Hy3DUploadMesh:
     @classmethod
@@ -1188,14 +1239,22 @@ class Hy3DGenerateMeshMultiView():
 
         pipeline.to(device)
 
-        if front is not None:
+        if front is not None and not torch.all(front < 1e-6).item():
             front = front.clone().permute(0, 3, 1, 2).to(device)
-        if back is not None:
+        else:
+            front = None
+        if back is not None and not torch.all(back < 1e-6).item():
             back = back.clone().permute(0, 3, 1, 2).to(device)
-        if left is not None:
+        else:
+            back = None
+        if left is not None and not torch.all(left < 1e-6).item():
             left = left.clone().permute(0, 3, 1, 2).to(device)
-        if right is not None:
+        else:
+            left = None
+        if right is not None and not torch.all(right < 1e-6).item():
             right = right.clone().permute(0, 3, 1, 2).to(device)
+        else:
+            right = None
             
         view_dict = {
             'front': front,
@@ -1820,6 +1879,8 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DMeshInfo": Hy3DMeshInfo,
     "Hy3DFastSimplifyMesh": Hy3DFastSimplifyMesh,
     "Hy3DNvdiffrastRenderer": Hy3DNvdiffrastRenderer,
+    "TrimeshToMESH": TrimeshToMESH,
+    "MESHToTrimesh": MESHToTrimesh,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1854,5 +1915,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DBPT": "Hy3D BPT",
     "Hy3DMeshInfo": "Hy3D Mesh Info",
     "Hy3DFastSimplifyMesh": "Hy3D Fast Simplify Mesh",
-    "Hy3DNvdiffrastRenderer": "Hy3D Nvdiffrast Renderer"
+    "Hy3DNvdiffrastRenderer": "Hy3D Nvdiffrast Renderer",
+    "TrimeshToMESH": "Trimesh to MESH",
+    "MESHToTrimesh": "MESH to Trimesh",
     }
